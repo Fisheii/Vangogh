@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>梵高的世界</title>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+    
+    <style>
+        body { margin: 0; padding: 0; background: #000; overflow: hidden; font-family: sans-serif; }
+        
+        #video-container {
+            position: relative;
+            width: 100vw; height: 100vh;
+            display: flex; justify-content: center; align-items: center;
+        }
+
+        video { width: 100%; height: 100%; object-fit: cover; }
+
+        .camera-preview {
+            position: absolute; bottom: 20px; right: 20px;
+            width: 200px; height: 150px;
+            border: 2px solid rgba(255, 255, 255, 0.3);
+            border-radius: 10px; opacity: 0.7;
+            transform: scaleX(-1); z-index: 10;
+        }
+        #outputCanvas { width: 100%; height: 100%; }
+        #inputVideo { display: none; }
+
+        #guide {
+            position: absolute; top: 20px; left: 20px;
+            color: rgba(255, 255, 255, 0.6); font-size: 16px; z-index: 10; pointer-events: none;
+            background: rgba(0,0,0,0.5); padding: 10px; border-radius: 5px;
+        }
+
+        /* 眨眼特效 */
+        .eyelid {
+            position: fixed; left: 0; width: 100%; height: 0%;
+            background: #000; z-index: 100; transition: height 0.3s ease-in-out;
+        }
+        #lid-top { top: 0; }
+        #lid-bottom { bottom: 0; }
+        .blink #lid-top, .blink #lid-bottom { height: 51%; }
+    </style>
+</head>
+<body>
+
+    <div id="guide">
+        🖐️ <b>推拉控制：</b> 平稳前后移动手掌<br>
+        👌 <b>捏合手指：</b> 切换视频<br>
+        <span id="debug-info" style="font-size:12px; color:#aaa">等待手势...</span>
+    </div>
+
+    <div id="lid-top" class="eyelid"></div>
+    <div id="lid-bottom" class="eyelid"></div>
+
+    <div id="video-container">
+        <video id="mainVideo" playsinline>
+            <source src="video1.mp4" type="video/mp4">
+        </video>
+    </div>
+
+    <div class="camera-preview">
+        <video id="inputVideo"></video>
+        <canvas id="outputCanvas"></canvas>
+    </div>
+
+<script>
+    const videoList = ['video1.mp4', 'video2.mp4', 'video3.mp4'];
+    let currentVideoIndex = 0;
+    
+    const videoElement = document.getElementById('inputVideo');
+    const canvasElement = document.getElementById('outputCanvas');
+    const canvasCtx = canvasElement.getContext('2d');
+    const mainVideo = document.getElementById('mainVideo');
+    const debugInfo = document.getElementById('debug-info');
+    
+    // --- 核心参数配置 ---
+    // 灵敏度：值越小，视频动得越慢。之前是80太快了，现在降到30。
+    const SENSITIVITY = 30; 
+    
+    // 平滑系数 (0.0 - 1.0)：值越小越平滑，但延迟越高。0.1 是一个很稳的值。
+    const SMOOTHING_FACTOR = 0.1; 
+    
+    // 死区阈值：如果计算出的时间变化小于这个值（秒），则忽略不计。防止手抖导致视频微颤。
+    const DEAD_ZONE = 0.08; 
+
+    // --- 状态变量 ---
+    let smoothedHandSize = 0; // 经过平滑处理的手掌大小
+    let isHandPresent = false;
+    let isPinching = false;
+    let isTransitioning = false;
+
+    // 线性插值函数 (Lerp) - 实现平滑的关键
+    function lerp(start, end, amt) {
+        return (1 - amt) * start + amt * end;
+    }
+
+    function onResults(results) {
+        canvasCtx.save();
+        canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+        canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
+
+        if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+            const landmarks = results.multiHandLandmarks[0];
+            
+            // 绘制骨架
+            drawConnectors(canvasCtx, landmarks, HAND_CONNECTIONS, {color: '#00FF00', lineWidth: 2});
+            drawLandmarks(canvasCtx, landmarks, {color: '#FF0000', lineWidth: 1});
+
+            handlePinch(landmarks);
+
+            if (!isTransitioning) {
+                handleSmoothedScrubbing(landmarks);
+            }
+            isHandPresent = true;
+        } else {
+            isHandPresent = false;
+            // 手离开时重置平滑值，下次手进来时重新初始化，防止跳变
+            smoothedHandSize = 0; 
+        }
+        canvasCtx.restore();
+    }
+
+    // 计算两点距离
+    function getDistance(p1, p2) {
+        return Math.hypot(p1.x - p2.x, p1.y - p2.y);
+    }
+
+    // 处理捏合切换
+    function handlePinch(landmarks) {
+        const thumbTip = landmarks[4];
+        const indexTip = landmarks[8];
+        const distance = getDistance(thumbTip, indexTip);
+
+        if (distance < 0.05) {
+            if (!isPinching && !isTransitioning) {
+                isPinching = true;
+                triggerBlinkTransition();
+            }
+        } else {
+            isPinching = false;
+        }
+    }
+
+    // 眨眼转场
+    function triggerBlinkTransition() {
+        isTransitioning = true;
+        document.body.classList.add('blink');
+        setTimeout(() => {
+            currentVideoIndex = (currentVideoIndex + 1) % videoList.length;
+            mainVideo.src = videoList[currentVideoIndex];
+            smoothedHandSize = 0; // 切换视频后重置手势状态
+            setTimeout(() => {
+                document.body.classList.remove('blink');
+                isTransitioning = false;
+            }, 200);
+        }, 300);
+    }
+
+    // --- 核心优化：平滑推拉逻辑 ---
+    function handleSmoothedScrubbing(landmarks) {
+        const wrist = landmarks[0];
+        const middleTip = landmarks[12];
+        
+        // 1. 获取当前帧的原始大小
+        const rawHandSize = getDistance(wrist, middleTip);
+
+        // 2. 初始化：如果这是手刚出现的第一帧，直接对齐，不要平滑过渡
+        if (smoothedHandSize === 0) {
+            smoothedHandSize = rawHandSize;
+            return;
+        }
+
+        // 3. 应用平滑算法：当前平滑值向目标值（原始值）移动一小步
+        // 这样即使 rawHandSize 在剧烈抖动，smoothedHandSize 也会变化得很圆润
+        smoothedHandSize = lerp(smoothedHandSize, rawHandSize, SMOOTHING_FACTOR);
+
+        // 4. 计算相对于上一帧的变化量 (Delta)
+        // 注意：这里我们比较的是 "当前平滑值" 和 "目标原始值" 之间的趋势，
+        // 或者更简单：我们记录上一帧的平滑值。
+        // 为了方便，我们这里通过比较 (Smoothed - PreviousSmoothed) 来驱动
+        // 但由于 lerp 的特性，我们需要用一个临时变量存储上一帧的状态
+        // 这里做一个简化的 Delta 计算：
+        
+        // 重新设计 Delta 逻辑：
+        // 我们需要由 "手的大小变化" 驱动 "时间变化"。
+        // 为了避免累积误差，我们比较 "本帧平滑后的大小" 与 "上一帧平滑后的大小"
+        // 但由于 JS 闭包特性，我们需要在函数外存储 prevSmoothedHandSize
+        // 下面是修正后的逻辑：
+    }
+
+    // 修正后的全局变量，用于存储上一帧状态
+    let prevSmoothedSize = 0;
+
+    // 覆盖上面的函数
+    function handleSmoothedScrubbing(landmarks) {
+        const wrist = landmarks[0];
+        const middleTip = landmarks[12];
+        const rawHandSize = getDistance(wrist, middleTip);
+
+        // 初始化
+        if (prevSmoothedSize === 0) {
+            prevSmoothedSize = rawHandSize;
+            return;
+        }
+
+        // 计算平滑后的当前大小
+        const currentSmoothedSize = lerp(prevSmoothedSize, rawHandSize, SMOOTHING_FACTOR);
+
+        // 计算变化量 (Delta)
+        const delta = currentSmoothedSize - prevSmoothedSize;
+
+        // 更新上一帧记录
+        prevSmoothedSize = currentSmoothedSize;
+
+        // --- 防抖处理 (Dead Zone) ---
+        // 计算原本应该改变的时间量
+        let timeDelta = delta * SENSITIVITY;
+
+        // 只有当时间变化量超过一定阈值，才真正应用到视频
+        // 这消除了微小的手抖
+        if (Math.abs(timeDelta) < DEAD_ZONE) {
+            timeDelta = 0;
+            debugInfo.innerText = "状态: 静止 (防抖中)";
+        } else {
+            debugInfo.innerText = `状态: ${timeDelta > 0 ? "⏩ 前进" : "⏪ 后退"} | 力度: ${Math.abs(timeDelta).toFixed(2)}`;
+        }
+
+        if (timeDelta !== 0) {
+            let newTime = mainVideo.currentTime + timeDelta;
+            // 边界限制
+            if (newTime < 0) newTime = 0;
+            if (newTime > mainVideo.duration) newTime = mainVideo.duration;
+            
+            mainVideo.currentTime = newTime;
+        }
+    }
+
+    // MediaPipe Setup
+    const hands = new Hands({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`});
+    hands.setOptions({
+        maxNumHands: 1,
+        modelComplexity: 1,
+        minDetectionConfidence: 0.5,
+        minTrackingConfidence: 0.5
+    });
+    hands.onResults(onResults);
+
+    const camera = new Camera(videoElement, {
+        onFrame: async () => { await hands.send({image: videoElement}); },
+        width: 320, height: 180
+    });
+    camera.start();
+
+</script>
+
+</body>
+</html>
